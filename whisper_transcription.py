@@ -38,9 +38,9 @@ except ModuleNotFoundError:
         return True  # 全当常见词
 
 # ---------- 路径 ----------
-INPUT_DIR  = r"C:\Users\24179\Desktop\ielts\data_audio"
-OUT_TRAIN  = r"C:\Users\24179\Desktop\ielts\data_result\training_data.json"
-OUT_MARKUP = r"C:\Users\24179\Desktop\ielts\data_result\markup.json"
+INPUT_DIR  = r"C:\Users\24179\Desktop\whisper-transcription-project\data_audio"
+OUT_TRAIN  = r"C:\Users\24179\Desktop\whisper-transcription-project\data_result\training_data.json"
+OUT_MARKUP = r"C:\Users\24179\Desktop\whisper-transcription-project\data_result\markup.json"
 os.makedirs(os.path.dirname(OUT_TRAIN), exist_ok=True)
 
 # ---------- 其他参数 ----------
