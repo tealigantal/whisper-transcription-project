@@ -1,171 +1,146 @@
 # ===============================================================
-#  Whisper ➜ training_data.json  +  markup.json
-#  功能：
-#    • 语音转文字 (Whisper)
-#    • 填充词 <filler> 标注
-#    • 停顿/静音 ⏸ 标注（仅写入 markup）
-#    • 生成训练用纯文本（含停顿 *次数* & *总时长*，不含逐点时间）
+#  Whisper ➜ training_data.json / .jsonl +  markup.json / .jsonl
 # ---------------------------------------------------------------
 #  依赖：
-#     pip install -U openai-whisper  # Whisper 官方包（含 torch）
-#     pip install -U tiktoken        # (可选) token 统计更准
-#     pip install -U wordfreq        # (可选) 生僻词辨识
+#     pip install --upgrade openai-whisper tqdm numpy
 #  Windows 需自装 ffmpeg 并加入 PATH
 # ===============================================================
 
-import os, subprocess, whisper, json, re, tempfile, sys, warnings, html
-from contextlib import redirect_stdout, redirect_stderr
+import os, re, json, html, warnings, subprocess, tempfile, wave, struct
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any
+from tqdm import tqdm
+import numpy as np
+import whisper
 
 warnings.filterwarnings("ignore")
 
-# ---------- token 计数 ----------
+# ---------- 可选：词频、token 计数（仅调试用，不写入文件） ----------
 try:
     import tiktoken
     enc = tiktoken.get_encoding("cl100k_base")
-    def count_tokens(text: str) -> int:
-        return len(enc.encode(text))
+    count_tokens = lambda s: len(enc.encode(s))
 except ModuleNotFoundError:
-    def count_tokens(text: str) -> int:
-        return len(text.split())
+    count_tokens = lambda s: 0
 
-# ---------- wordfreq (optional) ----------
-try:
-    from wordfreq import zipf_frequency
-    WORD_FREQ_READY = True
-    def is_common_word(w: str) -> bool:
-        return zipf_frequency(w.lower(), "en") > 1.5
-except ModuleNotFoundError:
-    WORD_FREQ_READY = False
-    def is_common_word(w: str) -> bool:
-        return True
+# ---------- 配置路径 ----------
+BASE_DIR   = Path(__file__).parent
+INPUT_DIR  = BASE_DIR / "data_audio"
+OUT_DIR    = BASE_DIR / "data_result"
+OUT_DIR.mkdir(exist_ok=True)
 
-# ---------- 路径 ----------
-INPUT_DIR  = r"C:\\Users\\24179\\Desktop\\whisper-transcription-project\\data_audio"
-OUT_TRAIN  = r"C:\\Users\\24179\\Desktop\\whisper-transcription-project\\data_result\\training_data.json"
-OUT_MARKUP = r"C:\\Users\\24179\\Desktop\\whisper-transcription-project\\data_result\\markup.json"
-os.makedirs(os.path.dirname(OUT_TRAIN), exist_ok=True)
+OUT_TRAIN_JSON   = OUT_DIR / "training_data.json"
+OUT_TRAIN_JSONL  = OUT_DIR / "training_data.jsonl"
+OUT_MARKUP_JSON  = OUT_DIR / "markup.json"
+OUT_MARKUP_JSONL = OUT_DIR / "markup.jsonl"
 
-# ---------- 其他参数 ----------
-SUPPORTED    = (".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".wma", ".webm")
-FFMPEG_OPTS  = ["-ar", "16000", "-ac", "1"]
-WHISPER_MOD  = "base"   # tiny / base / small / medium / large
-WHISPER_DEV  = "cpu"    # 改 "cuda" 如有显卡
-CONF_THR     = 0.7      # 置信度阈值
-PAUSE_THR    = 0.4      # 秒，视为停顿
-BAR_LEN      = 28
-FILLERS      = {"um", "uh", "like", "really", "actually"}
+SUPPORTED   = (".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".wma", ".webm")
+FFMPEG_OPTS = ["-ar", "16000", "-ac", "1"]
+WHISPER_MOD = "base"
+USE_FP16    = False   # 若 GPU 且显存足够可改 True
+PAUSE_TH_MS = 350     # 静音阈值：连续低能量 > 350ms 视为停顿
 
-# ---------- 工具 ----------
+# ---------- Whisper 模型 ----------
+print("⏳ Loading Whisper model:", WHISPER_MOD)
+model = whisper.load_model(WHISPER_MOD)
 
-def ensure_ffmpeg():
-    if subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode:
-        sys.exit("❌ 未检测到 ffmpeg，请安装并配置 PATH")
+# ---------- 工具函数 ----------
+def read_wave_mono(p: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(p), "rb") as wf:
+        sr = wf.getframerate()
+        n  = wf.getnframes()
+        sig = wf.readframes(n)
+        fmt = "<" + "h"*n*wf.getnchannels()
+        data = np.frombuffer(sig, np.int16).astype(np.float32) / 32768.0
+        if wf.getnchannels() == 2:
+            data = data[::2]
+        return data, sr
 
+def calc_pauses(data: np.ndarray, sr: int) -> tuple[int, float]:
+    frame = int(sr * 0.02)  # 20 ms
+    if len(data) < frame: return 0, 0.0
+    energy = (data[:len(data)//frame*frame]
+              .reshape(-1, frame) ** 2).mean(axis=1)
+    thr = energy.mean() * 0.5
+    pauses, cur = [], 0
+    for e in energy:
+        if e < thr:
+            cur += 20
+        else:
+            if cur >= PAUSE_TH_MS: pauses.append(cur/1000)
+            cur = 0
+    if cur >= PAUSE_TH_MS:
+        pauses.append(cur/1000)
+    return len(pauses), round(sum(pauses), 2)
 
-def to_wav(path: str) -> str:
-    """保证音频为 16‑kHz / 单声道 WAV。若不是则转码到临时文件。"""
-    if path.lower().endswith(".wav"):
-        meta=subprocess.run(["ffprobe","-v","error","-select_streams","a:0","-show_entries","stream=sample_rate,channels","-of","default=noprint_wrappers=1:nokey=1",path],text=True,capture_output=True).stdout.strip().splitlines()
-        if meta and meta[0]=="16000" and meta[1]=="1":
-            return path
-    fd,tmp=tempfile.mkstemp(suffix=".wav");os.close(fd)
-    if subprocess.run(["ffmpeg","-y","-i",path,*FFMPEG_OPTS,tmp],capture_output=True).returncode:
-        os.remove(tmp);raise RuntimeError("ffmpeg 转码失败:"+path)
-    return tmp
+def convert_to_wav(src: Path) -> Path:
+    if src.suffix.lower() == ".wav": return src
+    dst = Path(tempfile.mktemp(suffix=".wav"))
+    cmd = ["ffmpeg", "-loglevel", "quiet", "-y", "-i", str(src),
+           *FFMPEG_OPTS, str(dst)]
+    subprocess.run(cmd, check=True)
+    return dst
 
+def transcribe_audio(src: Path) -> Dict[str, Any]:
+    wav = convert_to_wav(src)
+    result = model.transcribe(str(wav), fp16=USE_FP16)
+    text = result["text"].strip()
+    data, sr = read_wave_mono(wav)
+    pause_cnt, pause_tot = calc_pauses(data, sr)
+    if wav != src: wav.unlink(missing_ok=True)   # 删除临时 wav
+    return {
+        "plain": text,
+        "pause_count": pause_cnt,
+        "pause_total": pause_tot,
+        "errors": []        # 如需后期写错误可扩展
+    }
 
-def whisper_transcribe(model, wav):
-    with open(os.devnull, "w") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
-        return model.transcribe(wav, verbose=False, word_timestamps=True)
-
-# ---------- 停顿 / 标注 ----------
-
-def split_words(segs):
-    return [w for seg in segs for w in seg.get("words", [])]
-
-
-def detect_pauses(words, thr=PAUSE_THR):
-    pauses, prev_end = [], None
-    for w in words:
-        if prev_end is not None:
-            gap = w["start"] - prev_end
-            if gap >= thr:
-                pauses.append(round(gap, 2))  # 仅记录时长
-        prev_end = w["end"]
-    return pauses
-
-
-def build_markup(words, pauses):
-    """生成纯文本 & 含 HTML 标注字符串。停顿在 markup 中插 ⏸。"""
-    plain, html_parts, errs = [], [], []
-    pauses_iter = iter(pauses)
-    next_pause_idx, next_pause = 0, next(pauses_iter, None)
-
-    for w in words:
-        # 插入该词前的停顿标记
-        if next_pause is not None and w["start"]-0.001 > 0 and next_pause_idx < len(pauses):
-            html_parts.append(f'<span class="pause" data-dur="{next_pause}">⏸ {next_pause}s</span>')
-            next_pause_idx += 1
-            next_pause = next(pauses_iter, None)
-
-        tok = w["word"]
-        plain.append(tok)
-        low = w.get("confidence", 1) < CONF_THR
-        uncommon = not is_common_word(tok) if WORD_FREQ_READY else False
-        cls = None
-        if tok.lower() in FILLERS:
-            cls = "filler"
-        elif (low or uncommon) and not tok.istitle():
-            cls = "err"; errs.append({"w": tok.strip(), "conf": round(w.get("confidence",1),3)})
-        html_parts.append(f'<span class="{cls}">{html.escape(tok)}</span>' if cls else html.escape(tok))
-
-    return " ".join(plain).strip(), "".join(html_parts).strip(), errs
-
-
-def make_compact(text, max_chars=400):
-    return " ".join(t for t in re.sub(r"\s+", " ", text).split() if t.lower() not in FILLERS)[:max_chars]
-
-# ---------- 主入口 ----------
-
+# ---------- 主流程 ----------
 def main():
-    ensure_ffmpeg()
-    print(f"Whisper Splitter • {datetime.now():%F %T}")
-    model = whisper.load_model(WHISPER_MOD, device=WHISPER_DEV)
+    files = [p for p in INPUT_DIR.iterdir() if p.suffix.lower() in SUPPORTED]
+    if not files:
+        print("⚠️  data_audio 目录为空")
+        return
 
-    audios = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(SUPPORTED)]
-    if not audios:
-        print("⚠️ 输入目录为空"); return
+    train_dict: Dict[str, Any] = {}
+    markup_list: List[Dict[str, str]] = []
 
-    train, markup, tot_tokens = {}, {}, 0
+    for fp in tqdm(files, desc="Transcribing"):
+        rec = transcribe_audio(fp)
+        # --- 此处曾写 tokens，现完全移除 ---
+        train_dict[fp.name] = rec
+        markup_list.append({
+            "file": fp.name,
+            "html": rec["plain"].replace("  ", " <mark>[pause]</mark> ")
+        })
 
-    for idx, file in enumerate(audios, 1):
-        bar = "█"*int(BAR_LEN*idx/len(audios)) + "░"*(BAR_LEN-int(BAR_LEN*idx/len(audios)))
-        print(f"\r[{bar}] {idx}/{len(audios)} {file}", end="", flush=True)
+    # ---------- 写 JSON ----------
+    OUT_TRAIN_JSON.write_text(json.dumps(train_dict, ensure_ascii=False, indent=2), "utf-8")
+    OUT_MARKUP_JSON.write_text(json.dumps(markup_list, ensure_ascii=False, indent=2), "utf-8")
 
-        wav = to_wav(os.path.join(INPUT_DIR, file))
-        res = whisper_transcribe(model, wav)
-        words = split_words(res["segments"])
-        pauses = detect_pauses(words)
-        plain, html_out, errs = build_markup(words, pauses)
+    # ---------- 写 JSONL ----------
+    OUT_TRAIN_JSONL.unlink(missing_ok=True)
+    with OUT_TRAIN_JSONL.open("w", encoding="utf-8") as fjl:
+        for rec in train_dict.values():
+            fjl.write(json.dumps({
+                "input": {
+                    "plain": rec["plain"],
+                    "pause_count": rec["pause_count"],
+                    "pause_total": rec["pause_total"],
+                    "errors": rec["errors"]
+                },
+                "output": {}
+            }, ensure_ascii=False) + "\n")
 
-        tok = count_tokens(plain); tot_tokens += tok
-        key = f"{os.path.splitext(file)[0]}_T{tok}{os.path.splitext(file)[1]}"
+    OUT_MARKUP_JSONL.unlink(missing_ok=True)
+    with OUT_MARKUP_JSONL.open("w", encoding="utf-8") as mljl:
+        for row in markup_list:
+            mljl.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-        train[key] = {
-            "plain": plain,
-            "compact": make_compact(plain),
-            "tokens": tok,
-            "errors": errs,
-            "pause_count": len(pauses),
-            "pause_total": round(sum(pauses), 2)
-        }
-        markup[key] = html_out
-
-    print("\n✅ 完成，总 token:", tot_tokens)
-    with open(OUT_TRAIN, "w", encoding="utf-8") as fp: json.dump(train, fp, ensure_ascii=False, indent=2)
-    with open(OUT_MARKUP, "w", encoding="utf-8") as fp: json.dump(markup, fp, ensure_ascii=False, indent=2)
-    print("📄 保存:", OUT_TRAIN, "|", OUT_MARKUP)
+    print("✅ All done! 生成文件：",
+          OUT_TRAIN_JSON.name, OUT_TRAIN_JSONL.name,
+          OUT_MARKUP_JSON.name, OUT_MARKUP_JSONL.name)
 
 if __name__ == "__main__":
     main()
